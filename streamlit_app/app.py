@@ -22,6 +22,55 @@ DEFAULT_UNIVERSE = [
     "INTC", "AMD", "CRM", "PFE", "XOM", "CVX", "WMT", "MCD", "NKE", "BA",
 ]
 
+# Kuratierte Rueckfalllisten, falls das Wikipedia-Scraping der
+# Index-Zusammensetzung fehlschlaegt (z.B. weil sich die Tabellenstruktur
+# geaendert hat). Kein Anspruch auf Vollstaendigkeit/Aktualitaet.
+NASDAQ100_FALLBACK = [
+    "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "TSLA", "AVGO",
+    "COST", "PEP", "ADBE", "NFLX", "CSCO", "AMD", "INTC", "QCOM", "TXN",
+    "INTU", "AMGN", "HON", "SBUX", "BKNG", "GILD", "MDLZ", "ADI", "VRTX",
+    "REGN", "ISRG", "LRCX",
+]
+EUROSTOXX50_FALLBACK = [
+    "ASML.AS", "SAP.DE", "MC.PA", "OR.PA", "TTE.PA", "SAN.PA", "SIE.DE",
+    "ALV.DE", "AIR.PA", "BNP.PA", "ITX.MC", "IBE.MC", "ENEL.MI", "ISP.MI",
+    "DTE.DE", "BAS.DE", "MUV2.DE", "ADS.DE", "DG.PA", "SU.PA",
+]
+
+INDEX_OPTIONS = {
+    "Standard-Liste (30 Aktien)": None,
+    "S&P 500": "sp500",
+    "Nasdaq-100": "nasdaq100",
+    "Euro Stoxx 50": "eurostoxx50",
+}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_index_tickers(index_key: str) -> tuple:
+    """Liest die Index-Zusammensetzung von Wikipedia, mit Rueckfall auf eine
+    kuratierte, statische Liste falls das Scraping fehlschlaegt."""
+    try:
+        if index_key == "sp500":
+            tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+            tickers = tables[0]["Symbol"].tolist()
+            tickers = [t.replace(".", "-") for t in tickers]
+        elif index_key == "nasdaq100":
+            tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
+            df = next(t for t in tables if "Ticker" in t.columns)
+            tickers = df["Ticker"].tolist()
+        elif index_key == "eurostoxx50":
+            tables = pd.read_html("https://en.wikipedia.org/wiki/EURO_STOXX_50")
+            df = next(t for t in tables if any(c in t.columns for c in ("Ticker", "Ticker symbol")))
+            col = "Ticker" if "Ticker" in df.columns else "Ticker symbol"
+            tickers = df[col].tolist()
+        else:
+            return tuple(DEFAULT_UNIVERSE)
+        tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
+        return tuple(dict.fromkeys(tickers))
+    except Exception:
+        fallback = {"sp500": DEFAULT_UNIVERSE, "nasdaq100": NASDAQ100_FALLBACK, "eurostoxx50": EUROSTOXX50_FALLBACK}
+        return tuple(fallback.get(index_key, DEFAULT_UNIVERSE))
+
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_price_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
@@ -50,26 +99,54 @@ def load_universe_snapshot(tickers: tuple) -> pd.DataFrame:
             if df.empty or len(df) < 60:
                 continue
             close = df["Close"]
+            volume = df["Volume"]
+            sma20 = close.rolling(20).mean().iloc[-1]
             sma50 = close.rolling(50).mean().iloc[-1]
             sma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else np.nan
             rsi = compute_rsi(close).iloc[-1]
             high_52w = df["High"].rolling(min(len(df), 252)).max().iloc[-1]
             low_52w = df["Low"].rolling(min(len(df), 252)).min().iloc[-1]
             last_close = close.iloc[-1]
+
+            # Relative Staerke nach Levy: aktueller Kurs / gleitender
+            # Durchschnitt der letzten 27 Wochen (~130 Handelstage).
+            # Der Rang (Perzentil ueber das ganze Universum) wird weiter
+            # unten nach der Schleife berechnet.
+            sma_levy = close.rolling(130).mean().iloc[-1] if len(close) >= 130 else np.nan
+            levy_rs = last_close / sma_levy if pd.notna(sma_levy) else np.nan
+
+            perf_1d = close.iloc[-1] / close.iloc[-2] - 1 if len(close) >= 2 else np.nan
+            perf_1w = close.iloc[-1] / close.iloc[-6] - 1 if len(close) >= 6 else np.nan
+            perf_1m = close.iloc[-1] / close.iloc[-22] - 1 if len(close) >= 22 else np.nan
+
+            avg_vol20 = volume.rolling(20).mean().iloc[-1]
+            vol_ratio = volume.iloc[-1] / avg_vol20 if pd.notna(avg_vol20) and avg_vol20 > 0 else np.nan
+
             rows.append({
                 "Ticker": ticker,
                 "Kurs": round(last_close, 2),
+                "SMA20": round(sma20, 2) if pd.notna(sma20) else np.nan,
                 "SMA50": round(sma50, 2) if pd.notna(sma50) else np.nan,
                 "SMA200": round(sma200, 2) if pd.notna(sma200) else np.nan,
                 "RSI14": round(rsi, 1) if pd.notna(rsi) else np.nan,
+                "Levy RS": round(levy_rs, 3) if pd.notna(levy_rs) else np.nan,
                 "52W Hoch": round(high_52w, 2),
                 "52W Tief": round(low_52w, 2),
                 "% vom 52W-Hoch": round((last_close / high_52w - 1) * 100, 1),
+                "1T %": round(perf_1d * 100, 1) if pd.notna(perf_1d) else np.nan,
+                "1W %": round(perf_1w * 100, 1) if pd.notna(perf_1w) else np.nan,
+                "1M %": round(perf_1m * 100, 1) if pd.notna(perf_1m) else np.nan,
+                "Vol-Ratio": round(vol_ratio, 2) if pd.notna(vol_ratio) else np.nan,
             })
         except Exception:
             continue
 
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        # RS-Rang: Perzentil-Rang der Levy-RS ueber das gesamte geladene
+        # Universum (1-99, aehnlich der IBD RS Rating), NaN bleibt NaN.
+        result["RS-Rang"] = (result["Levy RS"].rank(pct=True) * 100).round(0)
+    return result
 
 
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -137,19 +214,36 @@ with tab_charts:
 with tab_screener:
     st.write("Filtert eine Aktienliste nach einfachen technischen Kriterien (Daten von Yahoo Finance).")
 
+    index_choice = st.selectbox("Aktien-Universe", list(INDEX_OPTIONS.keys()))
     custom_input = st.text_input(
-        "Eigene Ticker (kommagetrennt, optional - überschreibt die Standardliste)",
+        "Eigene Ticker (kommagetrennt, optional - überschreibt die Auswahl oben)",
         "",
     )
-    universe = tuple(
-        t.strip().upper() for t in custom_input.split(",") if t.strip()
-    ) or tuple(DEFAULT_UNIVERSE)
 
-    c1, c2, c3, c4 = st.columns(4)
-    filter_above_sma50 = c1.checkbox("Kurs über SMA50", value=True)
-    filter_above_sma200 = c2.checkbox("Kurs über SMA200")
-    filter_oversold = c3.checkbox("RSI < 30 (überverkauft)")
-    filter_near_high = c4.checkbox("Innerhalb 10% vom 52W-Hoch")
+    if custom_input.strip():
+        universe = tuple(t.strip().upper() for t in custom_input.split(",") if t.strip())
+    elif INDEX_OPTIONS[index_choice] is None:
+        universe = tuple(DEFAULT_UNIVERSE)
+    else:
+        with st.spinner(f"Lade Ticker-Liste für {index_choice}..."):
+            universe = get_index_tickers(INDEX_OPTIONS[index_choice])
+        st.caption(f"{len(universe)} Ticker geladen.")
+
+    st.markdown("**Trend**")
+    t1, t2, t3, t4 = st.columns(4)
+    filter_above_sma20 = t1.checkbox("Kurs über SMA20")
+    filter_above_sma50 = t2.checkbox("Kurs über SMA50", value=True)
+    filter_above_sma200 = t3.checkbox("Kurs über SMA200")
+    cross_choice = t4.selectbox("SMA50/SMA200-Kreuzung", ["Keine Filterung", "Golden Cross (SMA50 > SMA200)", "Death Cross (SMA50 < SMA200)"])
+
+    st.markdown("**Momentum**")
+    m1, m2, m3, m4 = st.columns(4)
+    filter_oversold = m1.checkbox("RSI < 30 (überverkauft)")
+    min_rs_rank = m2.slider("Mindest RS-Rang (Levy)", 0, 99, 0, help="Perzentil-Rang der Relativen Stärke nach Levy über das gewählte Universum. 0 = Filter deaktiviert.")
+    filter_positive_1m = m3.checkbox("Positive 1-Monats-Performance")
+    filter_volume_breakout = m4.checkbox("Volumen-Ausbruch (>1.5x Ø)")
+
+    filter_near_high = st.checkbox("Innerhalb 10% vom 52W-Hoch")
 
     if st.button("Screener ausführen", type="primary"):
         with st.spinner(f"Lade Daten für {len(universe)} Ticker..."):
@@ -159,16 +253,28 @@ with tab_screener:
             st.error("Keine Daten gefunden. Bitte Ticker-Symbole prüfen.")
         else:
             result = snapshot.copy()
+            if filter_above_sma20:
+                result = result[result["Kurs"] > result["SMA20"]]
             if filter_above_sma50:
                 result = result[result["Kurs"] > result["SMA50"]]
             if filter_above_sma200:
                 result = result[result["Kurs"] > result["SMA200"]]
+            if cross_choice == "Golden Cross (SMA50 > SMA200)":
+                result = result[result["SMA50"] > result["SMA200"]]
+            elif cross_choice == "Death Cross (SMA50 < SMA200)":
+                result = result[result["SMA50"] < result["SMA200"]]
             if filter_oversold:
                 result = result[result["RSI14"] < 30]
+            if min_rs_rank > 0:
+                result = result[result["RS-Rang"] >= min_rs_rank]
+            if filter_positive_1m:
+                result = result[result["1M %"] > 0]
+            if filter_volume_breakout:
+                result = result[result["Vol-Ratio"] > 1.5]
             if filter_near_high:
                 result = result[result["% vom 52W-Hoch"] >= -10]
 
             st.write(f"**{len(result)} von {len(snapshot)} Aktien erfüllen die Kriterien:**")
-            st.dataframe(result.sort_values("% vom 52W-Hoch", ascending=False), use_container_width=True, hide_index=True)
+            st.dataframe(result.sort_values("RS-Rang", ascending=False), use_container_width=True, hide_index=True)
 
 st.caption("Daten von Yahoo Finance über yfinance. Nur zu Informationszwecken, keine Anlageberatung.")
