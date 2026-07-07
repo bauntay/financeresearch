@@ -17,6 +17,53 @@ from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Finance Research Dashboard", layout="wide")
 
+# Corporate-Design: dieselben zwei Blautoene und Schriftarten (Oswald/Overpass)
+# wie in den anderen Dashboards.
+BRAND_DARK_BLUE = "#004267"
+BRAND_LIGHT_BLUE = "#84bdce"
+
+st.markdown(
+    f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Overpass:wght@300;400;600;700&display=swap');
+
+    html, body, [class*="css"] {{
+        font-family: 'Overpass', sans-serif;
+    }}
+
+    h1, h2, h3, h4, h5, h6,
+    [data-testid="stMetricValue"],
+    [data-testid="stMetricLabel"],
+    .stTabs [data-baseweb="tab"] p {{
+        font-family: 'Oswald', sans-serif !important;
+        color: {BRAND_DARK_BLUE};
+    }}
+
+    [data-testid="stMetric"] {{
+        background-color: {BRAND_LIGHT_BLUE}22;
+        border-radius: 8px;
+        padding: 10px 14px;
+    }}
+
+    .stButton > button, .stDownloadButton > button {{
+        background-color: {BRAND_DARK_BLUE};
+        color: #FFFFFF;
+        border: 1px solid {BRAND_DARK_BLUE};
+    }}
+    .stButton > button:hover, .stDownloadButton > button:hover {{
+        background-color: {BRAND_LIGHT_BLUE};
+        color: {BRAND_DARK_BLUE};
+        border: 1px solid {BRAND_LIGHT_BLUE};
+    }}
+
+    .stTabs [aria-selected="true"] {{
+        border-bottom-color: {BRAND_LIGHT_BLUE} !important;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Watchlisten werden als JSON-Datei im GitHub-Repo gespeichert (ueber die
 # GitHub Contents API), damit sie geraeteuebergreifend erhalten bleiben.
 # Dafuer muss in den Streamlit-Cloud-Secrets ein GITHUB_TOKEN mit
@@ -119,6 +166,38 @@ INDEX_OPTIONS = {
     "Euro Stoxx 50": "eurostoxx50",
 }
 
+# Waehrung anhand des Yahoo-Finance-Ticker-Suffixes schaetzen (kein
+# Anspruch auf Vollstaendigkeit) - vermeidet einen zusaetzlichen API-Call
+# pro Ticker beim Screening groesserer Listen.
+SUFFIX_CURRENCY = {
+    "DE": "EUR", "PA": "EUR", "AS": "EUR", "MI": "EUR", "MC": "EUR",
+    "BR": "EUR", "LS": "EUR", "IR": "EUR", "VI": "EUR",
+    "L": "GBP", "TO": "CAD", "V": "CAD", "SW": "CHF",
+    "HK": "HKD", "T": "JPY", "AX": "AUD", "SA": "BRL",
+}
+
+
+def guess_currency(ticker: str) -> str:
+    if "." in ticker:
+        suffix = ticker.rsplit(".", 1)[-1].upper()
+        return SUFFIX_CURRENCY.get(suffix, "USD")
+    return "USD"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_currency(ticker: str) -> str:
+    """Fragt die tatsaechliche Handelswaehrung bei Yahoo Finance ab (ein
+    Ticker = ein Zusatz-Request, daher nur fuer den Einzelticker-Chart
+    genutzt), mit Rueckfall auf die Suffix-Schaetzung."""
+    try:
+        fast_info = yf.Ticker(ticker).fast_info
+        currency = fast_info.get("currency") if hasattr(fast_info, "get") else None
+        if currency:
+            return currency
+    except Exception:
+        pass
+    return guess_currency(ticker)
+
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_index_tickers(index_key: str) -> tuple:
@@ -200,6 +279,7 @@ def load_universe_snapshot(tickers: tuple) -> pd.DataFrame:
             rows.append({
                 "Ticker": ticker,
                 "Kurs": round(last_close, 2),
+                "Währung": guess_currency(ticker),
                 "SMA20": round(sma20, 2) if pd.notna(sma20) else np.nan,
                 "SMA50": round(sma50, 2) if pd.notna(sma50) else np.nan,
                 "SMA200": round(sma200, 2) if pd.notna(sma200) else np.nan,
@@ -268,6 +348,7 @@ with tab_charts:
         if df.empty:
             st.error(f"Keine Daten für '{ticker}' gefunden. Bitte Ticker-Symbol prüfen.")
         else:
+            currency = get_currency(ticker)
             df["SMA20"] = df["Close"].rolling(20).mean()
             df["SMA50"] = df["Close"].rolling(50).mean()
             df["RSI14"] = compute_rsi(df["Close"])
@@ -277,8 +358,8 @@ with tab_charts:
             change_pct = (latest["Close"] / prev_close - 1) * 100
 
             m1, m2, m3 = st.columns(3)
-            m1.metric("Letzter Kurs", f"{latest['Close']:.2f}", f"{change_pct:.2f}%")
-            m2.metric("SMA20", f"{latest['SMA20']:.2f}" if pd.notna(latest["SMA20"]) else "–")
+            m1.metric("Letzter Kurs", f"{latest['Close']:.2f} {currency}", f"{change_pct:.2f}%")
+            m2.metric("SMA20", f"{latest['SMA20']:.2f} {currency}" if pd.notna(latest["SMA20"]) else "–")
             m3.metric("RSI14", f"{latest['RSI14']:.1f}" if pd.notna(latest["RSI14"]) else "–")
 
             fig = make_subplots(
@@ -290,14 +371,17 @@ with tab_charts:
                 x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
                 name="Kurs",
             ), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=df["SMA20"], name="SMA20", line=dict(width=1)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=df["SMA50"], name="SMA50", line=dict(width=1)), row=1, col=1)
-            fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volumen", marker_color="gray"), row=2, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], name="RSI14", line=dict(color="orange")), row=3, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["SMA20"], name="SMA20", line=dict(width=1.5, color=BRAND_DARK_BLUE)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["SMA50"], name="SMA50", line=dict(width=1.5, color=BRAND_LIGHT_BLUE)), row=1, col=1)
+            fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volumen", marker_color=BRAND_LIGHT_BLUE), row=2, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], name="RSI14", line=dict(color=BRAND_DARK_BLUE)), row=3, col=1)
             fig.add_hline(y=70, line_dash="dot", line_color="red", row=3, col=1)
             fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
 
-            fig.update_layout(height=800, xaxis_rangeslider_visible=False, showlegend=True)
+            fig.update_layout(
+                height=800, xaxis_rangeslider_visible=False, showlegend=True,
+                font=dict(family="Overpass, sans-serif", color=BRAND_DARK_BLUE),
+            )
             st.plotly_chart(fig, use_container_width=True)
 
             with st.expander("Rohdaten anzeigen"):
