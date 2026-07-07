@@ -159,6 +159,23 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def style_sma_columns(df: pd.DataFrame):
+    """Hebt SMA20/SMA50/SMA200 hellgruen hervor, wenn der Kurs darueber
+    liegt, und hellrot, wenn er darunter liegt."""
+    def _row_style(row):
+        styles = pd.Series("", index=row.index)
+        for col in ("SMA20", "SMA50", "SMA200"):
+            if col not in row.index or pd.isna(row[col]) or pd.isna(row["Kurs"]):
+                continue
+            if row["Kurs"] > row[col]:
+                styles[col] = "background-color: #d4f7d4; color: #000000"
+            elif row["Kurs"] < row[col]:
+                styles[col] = "background-color: #f9d4d4; color: #000000"
+        return styles
+
+    return df.style.apply(_row_style, axis=1)
+
+
 st.title("📈 Finance Research Dashboard")
 
 tab_charts, tab_screener = st.tabs(["Kursdaten & Charts", "Stock-Screener"])
@@ -275,6 +292,8 @@ with tab_screener:
                 result = result[result["% vom 52W-Hoch"] >= -10]
 
             st.write(f"**{len(result)} von {len(snapshot)} Aktien erfüllen die Kriterien:**")
-            st.dataframe(result.sort_values("RS-Rang", ascending=False), use_container_width=True, hide_index=True)
+            st.caption("🟢 Kurs über dem gleitenden Durchschnitt · 🔴 Kurs darunter (SMA20/SMA50/SMA200).")
+            result_sorted = result.sort_values("RS-Rang", ascending=False)
+            st.dataframe(style_sma_columns(result_sorted), use_container_width=True, hide_index=True)
 
 st.caption("Daten von Yahoo Finance über yfinance. Nur zu Informationszwecken, keine Anlageberatung.")
