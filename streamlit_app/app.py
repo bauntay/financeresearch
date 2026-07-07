@@ -4,14 +4,89 @@ Zwei Bereiche: Kursdaten & Charts sowie ein einfacher Stock-Screener.
 Datenquelle: Yahoo Finance (via yfinance) - kostenlos, kein API-Key noetig.
 """
 
+import base64
+import json
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Finance Research Dashboard", layout="wide")
+
+# Watchlisten werden als JSON-Datei im GitHub-Repo gespeichert (ueber die
+# GitHub Contents API), damit sie geraeteuebergreifend erhalten bleiben.
+# Dafuer muss in den Streamlit-Cloud-Secrets ein GITHUB_TOKEN mit
+# Schreibrechten auf dieses Repo hinterlegt sein (siehe README).
+GITHUB_REPO = "bauntay/financeresearch"
+WATCHLIST_PATH = "streamlit_app/watchlists.json"
+
+
+def _get_secret(key: str, default=None):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+def _github_headers():
+    token = _get_secret("GITHUB_TOKEN")
+    if not token:
+        return None
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+
+
+def _github_branch() -> str:
+    return _get_secret("GITHUB_BRANCH", "main")
+
+
+def load_watchlists() -> dict:
+    headers = _github_headers()
+    if not headers:
+        return {}
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{WATCHLIST_PATH}"
+    try:
+        resp = requests.get(url, headers=headers, params={"ref": _github_branch()}, timeout=10)
+    except requests.exceptions.RequestException:
+        return {}
+    if resp.status_code == 200:
+        try:
+            raw = base64.b64decode(resp.json()["content"]).decode("utf-8")
+            return json.loads(raw)
+        except (KeyError, ValueError):
+            return {}
+    return {}
+
+
+def save_watchlists(data: dict) -> tuple:
+    headers = _github_headers()
+    if not headers:
+        return False, "Kein GITHUB_TOKEN in den Streamlit-Secrets hinterlegt (siehe README für die Einrichtung)."
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{WATCHLIST_PATH}"
+    branch = _github_branch()
+    try:
+        get_resp = requests.get(url, headers=headers, params={"ref": branch}, timeout=10)
+        sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+
+        payload = {
+            "message": "Update watchlists.json via Streamlit app",
+            "content": base64.b64encode(json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")).decode("utf-8"),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        put_resp = requests.put(url, headers=headers, json=payload, timeout=10)
+    except requests.exceptions.RequestException as exc:
+        return False, f"Netzwerkfehler beim Speichern: {exc}"
+
+    if put_resp.status_code in (200, 201):
+        return True, "Watchlist gespeichert."
+    return False, f"Fehler beim Speichern (HTTP {put_resp.status_code}): {put_resp.text[:200]}"
 
 # Kleine Auswahl an bekannten US-Aktien fuer den Screener.
 # Bewusst klein gehalten, damit der Live-Abruf auf dem kostenlosen
@@ -231,11 +306,43 @@ with tab_charts:
 with tab_screener:
     st.write("Filtert eine Aktienliste nach einfachen technischen Kriterien (Daten von Yahoo Finance).")
 
+    st.markdown("**Watchlisten**")
+    watchlists = load_watchlists()
+    if _github_headers() is None:
+        st.info("Watchlisten werden dauerhaft im GitHub-Repo gespeichert. Dafür muss einmalig ein `GITHUB_TOKEN` in den Streamlit-Cloud-Secrets hinterlegt werden (siehe README) – ohne Token können Watchlisten nicht gespeichert werden.")
+
+    wl_col1, wl_col2, wl_col3 = st.columns([2, 1, 1])
+    watchlist_names = sorted(watchlists.keys())
+    selected_watchlist = wl_col1.selectbox("Gespeicherte Watchlist", ["– keine –"] + watchlist_names)
+    if wl_col2.button("Laden", disabled=selected_watchlist == "– keine –"):
+        st.session_state["custom_ticker_input"] = ", ".join(watchlists[selected_watchlist])
+    if wl_col3.button("Löschen", disabled=selected_watchlist == "– keine –"):
+        watchlists.pop(selected_watchlist, None)
+        ok, msg = save_watchlists(watchlists)
+        (st.success if ok else st.error)(msg)
+        if ok:
+            st.rerun()
+
+    if "custom_ticker_input" not in st.session_state:
+        st.session_state["custom_ticker_input"] = ""
+
     index_choice = st.selectbox("Aktien-Universe", list(INDEX_OPTIONS.keys()))
     custom_input = st.text_input(
         "Eigene Ticker (kommagetrennt, optional - überschreibt die Auswahl oben)",
-        "",
+        key="custom_ticker_input",
     )
+
+    save_col1, save_col2 = st.columns([2, 1])
+    new_watchlist_name = save_col1.text_input("Name für neue/aktualisierte Watchlist (speichert die Ticker aus dem Feld oben)")
+    if save_col2.button("Watchlist speichern"):
+        if not new_watchlist_name.strip():
+            st.warning("Bitte einen Namen für die Watchlist angeben.")
+        elif not custom_input.strip():
+            st.warning("Bitte oben unter 'Eigene Ticker' mindestens einen Ticker eintragen.")
+        else:
+            watchlists[new_watchlist_name.strip()] = [t.strip().upper() for t in custom_input.split(",") if t.strip()]
+            ok, msg = save_watchlists(watchlists)
+            (st.success if ok else st.error)(msg)
 
     if custom_input.strip():
         universe = tuple(t.strip().upper() for t in custom_input.split(",") if t.strip())
