@@ -11,9 +11,30 @@ Der Code liegt in [`streamlit_app/app.py`](streamlit_app/app.py) und hat zwei Be
 
 - **Kursdaten & Charts**: Ticker eingeben, Candlestick-Chart mit SMA20/SMA50, Volumen
   und RSI(14).
-- **Stock-Screener**: filtert eine Liste von Aktien (Standardliste oder eigene
-  Ticker) nach einfachen Kriterien (über SMA50/SMA200, RSI < 30, nahe am
-  52-Wochen-Hoch).
+- **Stock-Screener**: filtert eine Liste von Aktien (S&P 500, Nasdaq-100, Euro
+  Stoxx 50, eigene Ticker oder gespeicherte Watchlisten) nach Trend- (SMA20/50/200,
+  Golden/Death Cross), Momentum- (RSI, Levy-RS-Rang, Performance, Volumen-Ausbruch)
+  und 52-Wochen-Kriterien. Treffer werden farblich hervorgehoben (grün = Kurs über
+  dem jeweiligen SMA, rot = darunter).
+
+## Watchlisten dauerhaft speichern (GitHub-Token einrichten)
+
+Watchlisten werden als `streamlit_app/watchlists.json` im Repo gespeichert, damit sie
+geräteübergreifend erhalten bleiben. Dafür braucht die App Schreibzugriff auf das
+Repo über ein GitHub Personal Access Token:
+
+1. Auf GitHub unter **Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens** ein neues Token erstellen, das nur auf dieses Repo
+   (`bauntay/financeresearch`) beschränkt ist, mit der Berechtigung
+   **Contents: Read and write**.
+2. In der Streamlit-Cloud-App unter **Settings → Secrets** Folgendes eintragen:
+   ```toml
+   GITHUB_TOKEN = "dein_token_hier"
+   GITHUB_BRANCH = "main"  # optional, Standard ist "main"
+   ```
+3. Speichern – die App liest den Token automatisch über `st.secrets`. Ohne
+   Token kann die App die Watchlisten weiterhin anzeigen, aber nicht neu
+   speichern oder löschen.
 
 ## Online nutzen (kein eigener Server nötig)
 
