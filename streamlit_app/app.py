@@ -1,11 +1,13 @@
 """
 Finance Research Dashboard
-Zwei Bereiche: Kursdaten & Charts sowie ein einfacher Stock-Screener.
+Zwei Bereiche: Kursdaten & Charts sowie Watchlists & Screener (gespeicherte
+Watchlists oder ganze Indizes nach technischen Kriterien filtern).
 Datenquelle: Yahoo Finance (via yfinance) - kostenlos, kein API-Key noetig.
 """
 
 import base64
 import json
+from io import StringIO
 
 import numpy as np
 import pandas as pd
@@ -33,8 +35,7 @@ st.markdown(
 
     h1, h2, h3, h4, h5, h6,
     [data-testid="stMetricValue"],
-    [data-testid="stMetricLabel"],
-    .stTabs [data-baseweb="tab"] p {{
+    [data-testid="stMetricLabel"] {{
         font-family: 'Oswald', sans-serif !important;
         color: {BRAND_DARK_BLUE};
     }}
@@ -45,19 +46,57 @@ st.markdown(
         padding: 10px 14px;
     }}
 
-    .stButton > button, .stDownloadButton > button {{
+    .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
         background-color: {BRAND_DARK_BLUE};
         color: #FFFFFF;
         border: 1px solid {BRAND_DARK_BLUE};
     }}
-    .stButton > button:hover, .stDownloadButton > button:hover {{
+    .stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {{
         background-color: {BRAND_LIGHT_BLUE};
         color: {BRAND_DARK_BLUE};
         border: 1px solid {BRAND_LIGHT_BLUE};
     }}
 
-    .stTabs [aria-selected="true"] {{
-        border-bottom-color: {BRAND_LIGHT_BLUE} !important;
+    /* Kompaktere vertikale Abstaende zwischen den Elementen */
+    div[data-testid="stVerticalBlock"] {{
+        gap: 0.65rem;
+    }}
+    .block-container {{
+        padding-top: 2.5rem;
+    }}
+    h1 {{
+        margin-bottom: 0.3rem;
+    }}
+
+    /* Seiten-Navigation (st.radio mit key="nav") als Tab-Pills stylen.
+       Bewusst ueber die st-key-Klasse gescoped, damit normale Radios
+       (z.B. die Quellen-Auswahl) unveraendert bleiben. */
+    .st-key-nav div[role="radiogroup"] {{
+        gap: 0.5rem;
+        flex-direction: row;
+    }}
+    .st-key-nav label[data-testid="stRadioOption"] {{
+        border: 1px solid {BRAND_LIGHT_BLUE};
+        border-radius: 999px;
+        padding: 0.3rem 1.1rem;
+        margin-right: 0;
+        background-color: #FFFFFF;
+        cursor: pointer;
+    }}
+    /* Radio-Kreis ausblenden, nur der Text bleibt sichtbar */
+    .st-key-nav label[data-testid="stRadioOption"] > div > div > div:first-child {{
+        display: none;
+    }}
+    .st-key-nav label[data-testid="stRadioOption"] p {{
+        font-family: 'Oswald', sans-serif !important;
+        color: {BRAND_DARK_BLUE};
+    }}
+    .st-key-nav label[data-testid="stRadioOption"][data-selected="true"] {{
+        background-color: {BRAND_DARK_BLUE};
+        border-color: {BRAND_DARK_BLUE};
+    }}
+    .st-key-nav label[data-testid="stRadioOption"][data-selected="true"] p {{
+        color: #FFFFFF !important;
     }}
     </style>
     """,
@@ -135,9 +174,8 @@ def save_watchlists(data: dict) -> tuple:
         return True, "Watchlist gespeichert."
     return False, f"Fehler beim Speichern (HTTP {put_resp.status_code}): {put_resp.text[:200]}"
 
-# Kleine Auswahl an bekannten US-Aktien fuer den Screener.
-# Bewusst klein gehalten, damit der Live-Abruf auf dem kostenlosen
-# Streamlit-Hosting schnell genug bleibt.
+# Statische Ersatzliste fuer den S&P 500, falls Wikipedia nicht
+# erreichbar ist. Kein Anspruch auf Vollstaendigkeit/Aktualitaet.
 DEFAULT_UNIVERSE = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B", "JPM",
     "V", "UNH", "HD", "PG", "MA", "DIS", "ADBE", "NFLX", "KO", "PEP", "CSCO",
@@ -160,7 +198,6 @@ EUROSTOXX50_FALLBACK = [
 ]
 
 INDEX_OPTIONS = {
-    "Standard-Liste (30 Aktien)": None,
     "S&P 500": "sp500",
     "Nasdaq-100": "nasdaq100",
     "Euro Stoxx 50": "eurostoxx50",
@@ -199,31 +236,81 @@ def get_currency(ticker: str) -> str:
     return guess_currency(ticker)
 
 
+def _read_wikipedia_tables(url: str) -> list:
+    # Expliziter Abruf per requests: pd.read_html laedt URLs sonst ueber
+    # urllib mit Standard-User-Agent, den Wikipedia teils blockiert.
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (FinanceDashboard)"}, timeout=20)
+    resp.raise_for_status()
+    return pd.read_html(StringIO(resp.text))
+
+
+def _pick_column(df: pd.DataFrame, candidates: tuple) -> str:
+    return next((c for c in candidates if c in df.columns), None)
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_index_tickers(index_key: str) -> tuple:
-    """Liest die Index-Zusammensetzung von Wikipedia, mit Rueckfall auf eine
-    kuratierte, statische Liste falls das Scraping fehlschlaegt."""
+def get_index_constituents(index_key: str) -> tuple:
+    """Liest die Index-Zusammensetzung (Ticker + Firmenname) von Wikipedia.
+    Gibt (DataFrame[Ticker, Name], quelle) zurueck; quelle ist "wikipedia"
+    oder "fallback" wenn stattdessen die statische Ersatzliste greift."""
+    urls = {
+        "sp500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        "nasdaq100": "https://en.wikipedia.org/wiki/Nasdaq-100",
+        "eurostoxx50": "https://en.wikipedia.org/wiki/EURO_STOXX_50",
+    }
     try:
+        tables = _read_wikipedia_tables(urls[index_key])
+        df = next(
+            t for t in tables
+            if _pick_column(t, ("Symbol", "Ticker", "Ticker symbol")) and len(t) >= 20
+        )
+        ticker_col = _pick_column(df, ("Symbol", "Ticker", "Ticker symbol"))
+        name_col = _pick_column(df, ("Security", "Company", "Company name", "Name"))
+
+        out = pd.DataFrame({
+            "Ticker": df[ticker_col].astype(str).str.strip().str.upper(),
+            "Name": df[name_col].astype(str).str.strip() if name_col else "",
+        })
         if index_key == "sp500":
-            tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-            tickers = tables[0]["Symbol"].tolist()
-            tickers = [t.replace(".", "-") for t in tickers]
-        elif index_key == "nasdaq100":
-            tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
-            df = next(t for t in tables if "Ticker" in t.columns)
-            tickers = df["Ticker"].tolist()
-        elif index_key == "eurostoxx50":
-            tables = pd.read_html("https://en.wikipedia.org/wiki/EURO_STOXX_50")
-            df = next(t for t in tables if any(c in t.columns for c in ("Ticker", "Ticker symbol")))
-            col = "Ticker" if "Ticker" in df.columns else "Ticker symbol"
-            tickers = df[col].tolist()
-        else:
-            return tuple(DEFAULT_UNIVERSE)
-        tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
-        return tuple(dict.fromkeys(tickers))
+            # Yahoo nutzt '-' statt '.' bei Aktienklassen (BRK.B -> BRK-B)
+            out["Ticker"] = out["Ticker"].str.replace(".", "-", regex=False)
+        out = out[out["Ticker"] != ""].drop_duplicates("Ticker").reset_index(drop=True)
+        if out.empty:
+            raise ValueError("Leere Ticker-Liste")
+        return out, "wikipedia"
     except Exception:
-        fallback = {"sp500": DEFAULT_UNIVERSE, "nasdaq100": NASDAQ100_FALLBACK, "eurostoxx50": EUROSTOXX50_FALLBACK}
-        return tuple(fallback.get(index_key, DEFAULT_UNIVERSE))
+        fallback = {
+            "sp500": DEFAULT_UNIVERSE,
+            "nasdaq100": NASDAQ100_FALLBACK,
+            "eurostoxx50": EUROSTOXX50_FALLBACK,
+        }[index_key]
+        return pd.DataFrame({"Ticker": fallback, "Name": [""] * len(fallback)}), "fallback"
+
+
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def get_ticker_name(ticker: str) -> str:
+    """Firmenname zu einem Ticker (ein API-Call pro Ticker, 7 Tage gecacht).
+    Nur fuer kleinere Universen wie Watchlisten gedacht."""
+    try:
+        info = yf.Ticker(ticker).info
+        return info.get("shortName") or info.get("longName") or ""
+    except Exception:
+        return ""
+
+
+def parse_ticker_csv(uploaded_file) -> list:
+    """Liest Ticker aus einer hochgeladenen CSV/TXT-Datei: pro Zeile zaehlt
+    die erste Spalte (Komma, Semikolon oder Tab als Trenner), Header-Zeilen
+    wie 'Ticker'/'Symbol' werden uebersprungen."""
+    raw = uploaded_file.getvalue().decode("utf-8-sig", errors="ignore")
+    tickers = []
+    for line in raw.splitlines():
+        first = line.replace(";", ",").replace("\t", ",").split(",")[0]
+        first = first.strip().strip('"').strip("'").upper()
+        if not first or first in ("TICKER", "SYMBOL", "TICKERS", "SYMBOLS", "NAME"):
+            continue
+        tickers.append(first)
+    return list(dict.fromkeys(tickers))
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -235,7 +322,9 @@ def load_price_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def load_universe_snapshot(tickers: tuple) -> pd.DataFrame:
+def load_universe_snapshot(tickers: tuple) -> tuple:
+    """Laedt Tagesdaten fuer alle Ticker und berechnet die Kennzahlen.
+    Gibt (DataFrame, uebersprungene_ticker) zurueck."""
     raw = yf.download(
         tickers=list(tickers),
         period="1y",
@@ -247,10 +336,15 @@ def load_universe_snapshot(tickers: tuple) -> pd.DataFrame:
     )
 
     rows = []
+    skipped = []
     for ticker in tickers:
         try:
-            df = raw[ticker].dropna(how="all") if len(tickers) > 1 else raw.dropna(how="all")
+            if isinstance(raw.columns, pd.MultiIndex):
+                df = raw[ticker].dropna(how="all")
+            else:
+                df = raw.dropna(how="all")
             if df.empty or len(df) < 60:
+                skipped.append(ticker)
                 continue
             close = df["Close"]
             volume = df["Volume"]
@@ -294,6 +388,7 @@ def load_universe_snapshot(tickers: tuple) -> pd.DataFrame:
                 "Vol-Ratio": round(vol_ratio, 2) if pd.notna(vol_ratio) else np.nan,
             })
         except Exception:
+            skipped.append(ticker)
             continue
 
     result = pd.DataFrame(rows)
@@ -301,7 +396,7 @@ def load_universe_snapshot(tickers: tuple) -> pd.DataFrame:
         # RS-Rang: Perzentil-Rang der Levy-RS ueber das gesamte geladene
         # Universum (1-99, aehnlich der IBD RS Rating), NaN bleibt NaN.
         result["RS-Rang"] = (result["Levy RS"].rank(pct=True) * 100).round(0)
-    return result
+    return result, tuple(skipped)
 
 
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -331,11 +426,28 @@ def style_sma_columns(df: pd.DataFrame):
     return df.style.apply(_row_style, axis=1)
 
 
+# Alle Screener-Filter an einer Stelle: Label -> Bedingung auf dem Snapshot.
+FILTERS = {
+    "Kurs über SMA20": lambda d: d["Kurs"] > d["SMA20"],
+    "Kurs über SMA50": lambda d: d["Kurs"] > d["SMA50"],
+    "Kurs über SMA200": lambda d: d["Kurs"] > d["SMA200"],
+    "Golden Cross (SMA50 > SMA200)": lambda d: d["SMA50"] > d["SMA200"],
+    "Death Cross (SMA50 < SMA200)": lambda d: d["SMA50"] < d["SMA200"],
+    "RSI < 30 (überverkauft)": lambda d: d["RSI14"] < 30,
+    "Positive 1-Monats-Performance": lambda d: d["1M %"] > 0,
+    "Volumen-Ausbruch (>1.5x Ø)": lambda d: d["Vol-Ratio"] > 1.5,
+    "Nahe 52W-Hoch (max. -10%)": lambda d: d["% vom 52W-Hoch"] >= -10,
+}
+
+
 st.title("📈 Finance Research Dashboard")
 
-tab_charts, tab_screener = st.tabs(["Kursdaten & Charts", "Stock-Screener"])
+# Navigation als Radio statt st.tabs: st.tabs springt bei jeder Eingabe
+# auf den ersten Tab zurueck, ein Radio mit key bleibt dagegen stabil.
+PAGES = ("Kursdaten & Charts", "Watchlists & Screener")
+page = st.radio("Bereich", PAGES, horizontal=True, key="nav", label_visibility="collapsed")
 
-with tab_charts:
+if page == PAGES[0]:
     col1, col2, col3 = st.columns([2, 1, 1])
     ticker = col1.text_input("Ticker", "AAPL").strip().upper()
     period = col2.selectbox("Zeitraum", ["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"], index=3)
@@ -387,104 +499,129 @@ with tab_charts:
             with st.expander("Rohdaten anzeigen"):
                 st.dataframe(df.tail(200), use_container_width=True)
 
-with tab_screener:
-    st.write("Filtert eine Aktienliste nach einfachen technischen Kriterien (Daten von Yahoo Finance).")
-
-    st.markdown("**Watchlisten**")
+else:
     watchlists = load_watchlists()
-    if _github_headers() is None:
-        st.info("Watchlisten werden dauerhaft im GitHub-Repo gespeichert. Dafür muss einmalig ein `GITHUB_TOKEN` in den Streamlit-Cloud-Secrets hinterlegt werden (siehe README) – ohne Token können Watchlisten nicht gespeichert werden.")
+    token_ok = _github_headers() is not None
 
-    wl_col1, wl_col2, wl_col3 = st.columns([2, 1, 1])
-    watchlist_names = sorted(watchlists.keys())
-    selected_watchlist = wl_col1.selectbox("Gespeicherte Watchlist", ["– keine –"] + watchlist_names)
-    if wl_col2.button("Laden", disabled=selected_watchlist == "– keine –"):
-        st.session_state["custom_ticker_input"] = ", ".join(watchlists[selected_watchlist])
-    if wl_col3.button("Löschen", disabled=selected_watchlist == "– keine –"):
-        watchlists.pop(selected_watchlist, None)
-        ok, msg = save_watchlists(watchlists)
-        (st.success if ok else st.error)(msg)
-        if ok:
-            st.rerun()
+    universe: tuple = ()
+    provided_names: dict = {}
+    heading = ""
+    NEW_WL = "➕ Neue Watchlist anlegen"
 
-    if "custom_ticker_input" not in st.session_state:
-        st.session_state["custom_ticker_input"] = ""
+    source = st.radio("Quelle", ["Meine Watchlists", "Index-Screening"], horizontal=True)
 
-    index_choice = st.selectbox("Aktien-Universe", list(INDEX_OPTIONS.keys()))
-    custom_input = st.text_input(
-        "Eigene Ticker (kommagetrennt, optional - überschreibt die Auswahl oben)",
-        key="custom_ticker_input",
-    )
+    if source == "Meine Watchlists":
+        options = sorted(watchlists.keys()) + [NEW_WL]
+        choice = st.selectbox("Watchlist", options, key="wl_select")
 
-    save_col1, save_col2 = st.columns([2, 1])
-    new_watchlist_name = save_col1.text_input("Name für neue/aktualisierte Watchlist (speichert die Ticker aus dem Feld oben)")
-    if save_col2.button("Watchlist speichern"):
-        if not new_watchlist_name.strip():
-            st.warning("Bitte einen Namen für die Watchlist angeben.")
-        elif not custom_input.strip():
-            st.warning("Bitte oben unter 'Eigene Ticker' mindestens einen Ticker eintragen.")
+        if choice == NEW_WL:
+            if not token_ok:
+                st.warning("Zum Speichern muss ein gültiger `GITHUB_TOKEN` in den Streamlit-Secrets hinterlegt sein (siehe README).")
+            with st.form("wl_create"):
+                new_name = st.text_input("Name der Watchlist")
+                new_tickers = st.text_input("Ticker (kommagetrennt, z.B. AAPL, SAP.DE, MC.PA)")
+                csv_file = st.file_uploader("…oder Ticker aus CSV importieren (erste Spalte = Ticker)", type=["csv", "txt"])
+                submitted = st.form_submit_button("Watchlist anlegen")
+            if submitted:
+                tickers = parse_ticker_csv(csv_file) if csv_file is not None else [
+                    t.strip().upper() for t in new_tickers.split(",") if t.strip()
+                ]
+                if not new_name.strip():
+                    st.error("Bitte einen Namen angeben.")
+                elif not tickers:
+                    st.error("Keine Ticker gefunden – Feld ausfüllen oder CSV hochladen.")
+                else:
+                    watchlists[new_name.strip()] = tickers
+                    ok, msg = save_watchlists(watchlists)
+                    if ok:
+                        st.session_state["wl_select"] = new_name.strip()
+                        st.rerun()
+                    else:
+                        st.error(msg)
         else:
-            watchlists[new_watchlist_name.strip()] = [t.strip().upper() for t in custom_input.split(",") if t.strip()]
-            ok, msg = save_watchlists(watchlists)
-            (st.success if ok else st.error)(msg)
+            universe = tuple(watchlists.get(choice, []))
+            heading = choice
 
-    if custom_input.strip():
-        universe = tuple(t.strip().upper() for t in custom_input.split(",") if t.strip())
-    elif INDEX_OPTIONS[index_choice] is None:
-        universe = tuple(DEFAULT_UNIVERSE)
+            with st.expander(f"„{choice}“ bearbeiten ({len(universe)} Titel)"):
+                add_col, rem_col = st.columns(2)
+                add_text = add_col.text_input("Ticker hinzufügen (kommagetrennt)", key=f"add_{choice}")
+                if add_col.button("Hinzufügen", key=f"add_btn_{choice}"):
+                    new = [t.strip().upper() for t in add_text.split(",") if t.strip()]
+                    if new:
+                        watchlists[choice] = list(dict.fromkeys(list(universe) + new))
+                        ok, msg = save_watchlists(watchlists)
+                        if ok:
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                to_remove = rem_col.multiselect("Ticker entfernen", list(universe), key=f"rem_{choice}")
+                if rem_col.button("Entfernen", key=f"rem_btn_{choice}") and to_remove:
+                    watchlists[choice] = [t for t in universe if t not in to_remove]
+                    ok, msg = save_watchlists(watchlists)
+                    if ok:
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                if st.button("Watchlist löschen", key=f"del_{choice}"):
+                    watchlists.pop(choice, None)
+                    ok, msg = save_watchlists(watchlists)
+                    if ok:
+                        st.session_state.pop("wl_select", None)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+            if not universe:
+                st.info("Diese Watchlist ist leer – füge über „bearbeiten“ Ticker hinzu.")
     else:
-        with st.spinner(f"Lade Ticker-Liste für {index_choice}..."):
-            universe = get_index_tickers(INDEX_OPTIONS[index_choice])
-        st.caption(f"{len(universe)} Ticker geladen.")
+        idx_label = st.selectbox("Index", list(INDEX_OPTIONS.keys()))
+        with st.spinner(f"Lade Zusammensetzung {idx_label}…"):
+            constituents, idx_source = get_index_constituents(INDEX_OPTIONS[idx_label])
+        if idx_source == "fallback":
+            st.warning(f"Live-Liste von Wikipedia nicht erreichbar – verwende statische Ersatzliste ({len(constituents)} Titel).")
+        universe = tuple(constituents["Ticker"])
+        provided_names = dict(zip(constituents["Ticker"], constituents["Name"]))
+        heading = idx_label
 
-    st.markdown("**Trend**")
-    t1, t2, t3, t4 = st.columns(4)
-    filter_above_sma20 = t1.checkbox("Kurs über SMA20")
-    filter_above_sma50 = t2.checkbox("Kurs über SMA50", value=True)
-    filter_above_sma200 = t3.checkbox("Kurs über SMA200")
-    cross_choice = t4.selectbox("SMA50/SMA200-Kreuzung", ["Keine Filterung", "Golden Cross (SMA50 > SMA200)", "Death Cross (SMA50 < SMA200)"])
+    if universe:
+        fcol1, fcol2 = st.columns([3, 1])
+        active_filters = fcol1.multiselect(
+            "Filter", list(FILTERS.keys()),
+            placeholder="Keine Filter aktiv – alle Titel werden angezeigt",
+        )
+        min_rs_rank = fcol2.slider(
+            "Min. RS-Rang (Levy)", 0, 99, 0,
+            help="Perzentil-Rang der Relativen Stärke nach Levy über das gewählte Universum. 0 = aus.",
+        )
 
-    st.markdown("**Momentum**")
-    m1, m2, m3, m4 = st.columns(4)
-    filter_oversold = m1.checkbox("RSI < 30 (überverkauft)")
-    min_rs_rank = m2.slider("Mindest RS-Rang (Levy)", 0, 99, 0, help="Perzentil-Rang der Relativen Stärke nach Levy über das gewählte Universum. 0 = Filter deaktiviert.")
-    filter_positive_1m = m3.checkbox("Positive 1-Monats-Performance")
-    filter_volume_breakout = m4.checkbox("Volumen-Ausbruch (>1.5x Ø)")
-
-    filter_near_high = st.checkbox("Innerhalb 10% vom 52W-Hoch")
-
-    if st.button("Screener ausführen", type="primary"):
-        with st.spinner(f"Lade Daten für {len(universe)} Ticker..."):
-            snapshot = load_universe_snapshot(universe)
+        with st.spinner(f"Lade Kursdaten für {len(universe)} Titel…"):
+            snapshot, skipped = load_universe_snapshot(universe)
 
         if snapshot.empty:
-            st.error("Keine Daten gefunden. Bitte Ticker-Symbole prüfen.")
+            st.error("Keine Kursdaten gefunden – bitte Ticker prüfen.")
         else:
-            result = snapshot.copy()
-            if filter_above_sma20:
-                result = result[result["Kurs"] > result["SMA20"]]
-            if filter_above_sma50:
-                result = result[result["Kurs"] > result["SMA50"]]
-            if filter_above_sma200:
-                result = result[result["Kurs"] > result["SMA200"]]
-            if cross_choice == "Golden Cross (SMA50 > SMA200)":
-                result = result[result["SMA50"] > result["SMA200"]]
-            elif cross_choice == "Death Cross (SMA50 < SMA200)":
-                result = result[result["SMA50"] < result["SMA200"]]
-            if filter_oversold:
-                result = result[result["RSI14"] < 30]
+            # Firmennamen: aus der Index-Liste, sonst (nur bei kleinen
+            # Universen) einzeln von Yahoo nachladen.
+            names = dict(provided_names)
+            if not any(names.values()) and len(universe) <= 60:
+                with st.spinner("Lade Firmennamen…"):
+                    names = {t: get_ticker_name(t) for t in snapshot["Ticker"]}
+            snapshot.insert(1, "Name", snapshot["Ticker"].map(names).fillna(""))
+
+            result = snapshot
+            for label in active_filters:
+                result = result[FILTERS[label](result)]
             if min_rs_rank > 0:
                 result = result[result["RS-Rang"] >= min_rs_rank]
-            if filter_positive_1m:
-                result = result[result["1M %"] > 0]
-            if filter_volume_breakout:
-                result = result[result["Vol-Ratio"] > 1.5]
-            if filter_near_high:
-                result = result[result["% vom 52W-Hoch"] >= -10]
 
-            st.write(f"**{len(result)} von {len(snapshot)} Aktien erfüllen die Kriterien:**")
-            st.caption("🟢 Kurs über dem gleitenden Durchschnitt · 🔴 Kurs darunter (SMA20/SMA50/SMA200).")
-            result_sorted = result.sort_values("RS-Rang", ascending=False)
-            st.dataframe(style_sma_columns(result_sorted), use_container_width=True, hide_index=True)
+            st.markdown(f"**{heading}: {len(result)} von {len(snapshot)} Titeln**")
+            st.caption("🟢 Kurs über dem gleitenden Durchschnitt · 🔴 darunter (SMA20/50/200)")
+            st.dataframe(
+                style_sma_columns(result.sort_values("RS-Rang", ascending=False)),
+                use_container_width=True, hide_index=True,
+                height=min(620, 42 + 36 * max(len(result), 1)),
+            )
+            if skipped:
+                st.caption(f"⚠️ Keine oder zu wenige Kursdaten für: {', '.join(skipped)}")
 
 st.caption("Daten von Yahoo Finance über yfinance. Nur zu Informationszwecken, keine Anlageberatung.")

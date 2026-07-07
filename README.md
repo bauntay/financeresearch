@@ -11,11 +11,14 @@ Der Code liegt in [`streamlit_app/app.py`](streamlit_app/app.py) und hat zwei Be
 
 - **Kursdaten & Charts**: Ticker eingeben, Candlestick-Chart mit SMA20/SMA50, Volumen
   und RSI(14).
-- **Stock-Screener**: filtert eine Liste von Aktien (S&P 500, Nasdaq-100, Euro
-  Stoxx 50, eigene Ticker oder gespeicherte Watchlisten) nach Trend- (SMA20/50/200,
-  Golden/Death Cross), Momentum- (RSI, Levy-RS-Rang, Performance, Volumen-Ausbruch)
-  und 52-Wochen-Kriterien. Treffer werden farblich hervorgehoben (grün = Kurs über
-  dem jeweiligen SMA, rot = darunter).
+- **Watchlists & Screener**: Watchlists anlegen (manuell oder per CSV-Import,
+  erste Spalte = Ticker), ansehen, bearbeiten (Ticker hinzufügen/entfernen) und
+  nach technischen Kriterien filtern – oder alternativ einen ganzen Index
+  screenen (S&P 500, Nasdaq-100, Euro Stoxx 50, live von Wikipedia geladen).
+  Die Tabelle zeigt Firmennamen und Währung, Filter (SMA20/50/200, Golden/Death
+  Cross, RSI, Levy-RS-Rang, Performance, Volumen, 52W-Hoch) werden über eine
+  kompakte Mehrfachauswahl kombiniert. SMA-Spalten sind farblich markiert
+  (grün = Kurs über dem jeweiligen SMA, rot = darunter).
 
 ## Watchlisten dauerhaft speichern (GitHub-Token einrichten)
 
